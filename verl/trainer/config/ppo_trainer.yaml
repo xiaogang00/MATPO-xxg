@@ -201,6 +201,9 @@ actor_rollout_ref:
     # Sequence parallelism size for Ulysses-style model parallelism
     ulysses_sequence_parallel_size: 1
 
+    ## which manner to compute log prob
+    log_compute_type: 'turn'
+
     # checkpoint configs
     checkpoint:
     
