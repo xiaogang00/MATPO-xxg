@@ -374,3 +374,144 @@ Here is an example of the required format:
         raise ValueError(f"Unknown agent type: {agent_type}")
 
     return summarize_prompt
+
+
+def generate_agent_summarize_prompt_and_give_answer(task_description, main_query=None, task_failed=False, agent_type=""):
+    if agent_type == "main_agent":
+        failed_instruction = ""
+        if task_failed:
+            failed_instruction = "You have failed to complete the task. Review the conversation and provide a final answer based on the information gathered. If a definitive answer cannot be determined, state that clearly."
+
+        summarize_prompt = f"""
+[SYSTEM]
+This is a direct instruction to you. This is your final turn. You MUST NOT use any tools.
+Your task is to provide a final, structured report summarizing the entire conversation and providing a definitive answer to the original task.
+
+The original task was: "{task_description}"
+
+[INSTRUCTIONS]
+
+{failed_instruction}
+
+Your final response MUST be a clear, complete, and structured report in markdown format.
+Organize the content into logical sections with the following headings: `## Conclusion`, `## Supporting Information`, and `## Observations`.
+
+- **CRITICAL**: Do NOT include any raw URLs.
+- Your response should only contain factual, specific, and well-organized information based on the conversation.
+- Do not include speculative filler, vague summaries, or conversational text.
+
+Here is an example of the required format:
+
+# Final Response: [Title summarizing the task]
+
+## Conclusion:
+[A concise summary of your findings and the final answer to the user's question. Bold key information. If the answer is a number or short phrase, provide it directly.]
+
+## Supporting Information:
+[Detailed supporting facts, data, or quotes from the conversation that support your conclusion. Use bullet points or numbered lists for clarity.]
+- Source 1: Brief description of finding 1.
+- Source 2: Brief description of finding 2.
+
+## Observations:
+[Any additional context, confidence level, or notes on how the final answer was derived from the conversation history.]
+"""
+    elif agent_type == "browsing_agent":
+        failed_instruction = ""
+        if task_failed:
+            failed_instruction = "You have failed to complete the task. Do not attempt to answer the original task. Instead, clearly acknowledge that the task has failed and explain why in the 'Observations' section."
+
+        summarize_prompt = f"""
+[SYSTEM]
+This is a direct instruction to you. This is your final turn. You MUST NOT use any tools.
+Your task is to provide a final, structured report summarizing all the information you have gathered to answer your assigned subtask.
+At the end of the report, you should try to provide an answer to the main task.
+
+[CONTEXT]
+The main task was: "{main_query}"
+Your assigned subtask was: "{task_description}"
+Your assigned subtask was intended to help solve the main task.
+
+[INSTRUCTIONS]
+
+{failed_instruction}
+
+Your final response MUST be a clear, complete, and structured report in markdown format.
+An answer to the main task should be presented at the end of the report.
+Organize the content into logical sections with the following headings: `## Conclusion`, `## Supporting Information`, `## Observations`, `## Contribution to Main Task`, and `## Final Answer`.
+
+- **CRITICAL**: Do NOT include raw URLs. Replace any URLs with `([link])`.
+- Your response should only contain factual, specific, and well-organized information based on your previous actions.
+- Do not include speculative filler, vague summaries, or conversational text.
+- You should follow the format instruction in the main task strictly and wrap the answer to the main task in \\boxed{{}}. Please note that this answer was intended only to help solve the main task.
+
+Here is an example of the required format:
+
+# Final Response: [Title summarizing the subtask]
+
+## Conclusion:
+[A concise summary of your findings and the final answer for the subtask. Bold key information.]
+
+## Supporting Information:
+[Detailed supporting facts, data, or quotes you discovered. Use bullet points or numbered lists for clarity.]
+- Source 1: Brief description of finding 1.
+- Source 2: Brief description of finding 2.
+
+## Observations:
+[Any additional context, confidence level, or notes on how the conclusion was reached.]
+
+## Contribution to Main Task:
+[Explain how the answer to your subtask helps solve the overall main task. What are the next steps the main agent should consider?]
+
+## Answer:
+[Try to provde an answer to the main task. You should follow the format instruction in the requestion strictly and wrap the answer in \\boxed{{}}.]
+"""
+    else:
+        raise ValueError(f"Unknown agent type: {agent_type}")
+
+    return summarize_prompt
+
+
+
+
+def generate_agent_summarize_prompt_stage_wise_main_agent(task_description, task_failed=False):
+    ##if agent_type == "main_agent":
+    failed_instruction = ""
+    if task_failed:
+        failed_instruction = "You have failed to complete the task. Review the conversation and provide a final answer based on the information gathered. If a definitive answer cannot be determined, state that clearly."
+
+    summarize_prompt = f"""
+[SYSTEM]
+This is a direct instruction to you. This is your final turn. You MUST NOT use any tools.
+Your task is to provide a final, structured report summarizing the entire conversation and providing a definitive answer to the original task.
+
+The original task was: "{task_description}"
+
+[INSTRUCTIONS]
+
+{failed_instruction}
+
+Your final response MUST be a clear, complete, and structured report in markdown format.
+Organize the content into logical sections with the following headings: `## Conclusion`, `## Supporting Information`, and `## Observations`.
+
+- **CRITICAL**: Do NOT include any raw URLs.
+- Your response should only contain factual, specific, and well-organized information based on the conversation.
+- Do not include speculative filler, vague summaries, or conversational text.
+- You should wrap the final answer to the original task in \\boxed{{}}, in `## Conclusion`.
+
+Here is an example of the required format:
+
+# Final Response: [Title summarizing the task]
+
+## Conclusion:
+[A concise summary of your findings and the final answer to the user's question. Bold key information. If the answer is a number or short phrase, provide it directly. You should wrap the final answer to the original task in \\boxed{{}}]
+
+## Supporting Information:
+[Detailed supporting facts, data, or quotes from the conversation that support your conclusion. Use bullet points or numbered lists for clarity.]
+- Source 1: Brief description of finding 1.
+- Source 2: Brief description of finding 2.
+
+## Observations:
+[Any additional context, confidence level, or notes on how the final answer was derived from the conversation history.]
+"""
+
+    return summarize_prompt
