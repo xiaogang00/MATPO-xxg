@@ -10,6 +10,16 @@ custom_reward_function:
   name: simpleqa_compute_score # available scorers: gaia_naive_compute_score, simpleqa_compute_score, browsecomp_compute_score, gpt41_compute_score, cascade_compute_score
   path: "./verl/utils/reward_score/llm_judge.py"
 reward_model:
+  reward_manager: subagent_tool_new
+  reward_kwargs:
+    accuracy_reward_weight: 0.9
+    tool_format_reward_weight: 0.1
+    gate_tool_format_reward: False # If set to True, the tool format reward will not be given unless the final answer is correct, even if the tool format is correct. If set to False, the tool format reward will be given as long as the tool format is correct, regardless of whether the final answer is correct.
+    async_process: True
+    batch_size: 300
+    max_retry: 3
+
+reward_model_val:
   reward_manager: subagent_tool
   reward_kwargs:
     accuracy_reward_weight: 0.9
