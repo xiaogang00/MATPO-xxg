@@ -72,6 +72,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    GRPO_TURN = "grpo_turn"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -219,6 +220,103 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+@register_adv_est(AdvantageEstimator.GRPO_TURN) # or simply: @register_adv_est("grpo")
+def compute_grpo_outcome_advantage_turn(
+    token_level_rewards: torch.Tensor,
+    token_level_rewards_subagent: torch.Tensor,
+    reqs_ids_list: np.ndarray,
+    parent_reqs_ids_list: np.ndarray,
+    response_mask: torch.Tensor,
+    response_mask_subagent: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: str = True,
+):
+    """
+    Compute advantage for GRPO, operating only on Outcome reward
+    (with only one scalar reward for each response).
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        norm_adv_by_std_in_grpo: (bool)
+            whether to scale the GRPO advantage.
+            If True, the advantage is scaled by the std, as in the original GRPO.
+            If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    ##scores = token_level_rewards.sum(dim=-1)
+    scores = token_level_rewards.sum(dim=-1)
+    scores_original = token_level_rewards
+    scores_subagent = token_level_rewards_subagent.sum(dim=-1)
+
+    loss_mask = response_mask.clone()
+    length = scores.shape[0]
+    reward_location_mask = torch.zeros_like(token_level_rewards)
+    end_locations = []
+    for i in range(length):
+        loss_mask_this = loss_mask[i]
+        end_location = [j-1 for j in range(1, len(loss_mask_this)) if (loss_mask_this[j-1] == 1 and loss_mask_this[j] == 0)]
+        if loss_mask_this[-1] == 1:
+            end_location.append(len(loss_mask_this)-1)
+        for j in range(len(end_location)):
+            reward_location_mask[i, end_location[j]] = 1
+        end_locations.append(end_location)
+        if len(end_location) > 1:
+            scores[i] = scores[i] * 1.0 / len(end_location)
+
+    parent_idx_list = np.array([None] * len(token_level_rewards_subagent))
+    for i in range(len(token_level_rewards_subagent)):
+        parent_idx_list[i] = np.where(reqs_ids_list == parent_reqs_ids_list[i])[0][0]
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores_original[i] = (scores_original[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                scores_subagent[parent_idx_list==i] = (scores_subagent[parent_idx_list==i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores_original[i] = scores_original[i] - id2mean[index[i]]
+                scores_subagent[parent_idx_list==i] = scores_subagent[parent_idx_list==i] - id2mean[index[i]]
+            scores_original[i] = scores_original[i] * reward_location_mask[i]
+            end_location_this = end_locations[i]
+            for j in range(len(end_location_this)):
+                if j == 0:
+                    location_previous = 0
+                location_current = end_location_this[j]
+                scores_original[i, location_previous:location_current] = scores_original[i, location_current]
+                location_previous = location_current+1
+        scores_original = scores_original * response_mask
+        scores_subagent = scores_subagent.unsqueeze(-1) * response_mask_subagent
+
+        ##import pdb; pdb.set_trace()
+    return scores_original, scores_original, scores_subagent, scores_subagent
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK) # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(
