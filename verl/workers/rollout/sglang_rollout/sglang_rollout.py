@@ -58,7 +58,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizer
 
-from examples.data_preprocess.prompt_utils import generate_agent_summarize_prompt
+from examples.data_preprocess.prompt_utils import generate_agent_summarize_prompt, generate_agent_summarize_prompt_stage_wise_main_agent
 from verl import DataProto
 from verl.third_party.sglang import parallel_state as sglang_ps
 from verl.tools.base_tool import BaseTool
@@ -868,6 +868,7 @@ Provide a detailed answer and supporting information for this subtask. Your answ
                     request_id=str(uuid4()),
                     state=AsyncRolloutRequestStateEnum.PENDING,
                     messages=messages,
+                    summary_stages=[],
                     tool_schemas=_req.tool_schemas,
                     tools_kwargs=_req.tools_kwargs,
                     input_ids=None,
@@ -946,6 +947,69 @@ Provide a detailed answer and supporting information for this subtask. Your answ
         _req.add_assistant_message(self.tokenizer, content, use_mcp_tool_call=use_mcp_tool_call, keep_think_text_for_last_round_only=keep_think_text_for_last_round_only, think_block_close_tag=think_block_close_tag)
         
         return _req
+    
+
+    async def final_summary_stage(
+        self, 
+        _req: AsyncRolloutRequest, 
+        tool_call_contents: list[str], 
+        task_failed: bool, 
+        do_sample: bool, 
+        is_validate: bool, 
+        use_mcp_tool_call: bool, 
+        keep_think_text_for_last_round_only: bool, 
+        think_block_close_tag: str, 
+        **kwargs
+    ) -> str:
+
+        # 1. get summarize prompt
+        assert _req.messages[1].role == "user"
+        current_user_prompt = _req.messages[1].content 
+
+        #main_query = None
+        #task_description = None
+
+        task_description = current_user_prompt
+        '''
+        if agent_type == "main_agent":
+            task_description = current_user_prompt
+        else:  # subagent
+            # Parse main_query and task_description from subagent_user_prompt
+            main_query_match = re.search(r'The main task is: "(.*?)"', current_user_prompt, re.DOTALL)
+            if main_query_match:
+                main_query = main_query_match.group(1)
+
+            task_description_match = re.search(r'Your current subtask is: "(.*?)"', current_user_prompt, re.DOTALL)
+            if task_description_match:
+                task_description = task_description_match.group(1)
+
+            if not task_description:
+                task_description = current_user_prompt  # fallback
+        '''
+        
+        recovered_messages = [msg.model_copy(deep=True) for msg in _req.messages]
+
+        summarize_prompt = generate_agent_summarize_prompt_stage_wise_main_agent(
+            task_description=task_description, task_failed=task_failed
+        )
+        
+        # 2. add summarize prompt to messages
+        _req.add_tool_response_messages(self.tokenizer, tool_call_contents+[summarize_prompt], use_mcp_tool_call=use_mcp_tool_call)
+
+        # 3. Truncate messages based on the remaining input context length after
+        #    adding the summarize prompt. Respect SGLang's headroom (5 tokens)
+        #    and one EOS token, and reserve the summary generation budget.
+        max_input_len = max(0, self.config.max_model_len - (5 + 1) - self.config.multi_turn.max_summary_length)
+        _req.truncate_messages(self.tokenizer, max_input_len, use_mcp_tool_call, keep_think_text_for_last_round_only, think_block_close_tag)
+
+        # 4. generate summary
+        output = await self._handle_engine_call(_req, do_sample, is_validate, **kwargs)
+        content = output["text"]
+
+        _req.rebuild_messages(recovered_messages, self.tokenizer, use_mcp_tool_call, keep_think_text_for_last_round_only, think_block_close_tag) 
+
+        ## _req.add_assistant_message(self.tokenizer, content, use_mcp_tool_call=use_mcp_tool_call, keep_think_text_for_last_round_only=keep_think_text_for_last_round_only, think_block_close_tag=think_block_close_tag)
+        return content
 
     async def _async_rollout_a_request(
         self,
@@ -1006,9 +1070,9 @@ Provide a detailed answer and supporting information for this subtask. Your answ
                                 continue
 
                             # 2. Use subagent sys prompt and fresh context to rollout
-                            agent_type = self.subagent_tool_name_to_agent_type[tool_call.function.name]
-                            _req_agent = self.create_subagent_tool_request(tool_call, agent_type, _req, current_turns)
-                            subagent_result = await self._async_rollout_a_request(_req_agent, do_sample, is_validate, agent_type=agent_type, **kwargs)
+                            agent_type_this = self.subagent_tool_name_to_agent_type[tool_call.function.name]
+                            _req_agent = self.create_subagent_tool_request(tool_call, agent_type_this, _req, current_turns)
+                            subagent_result = await self._async_rollout_a_request(_req_agent, do_sample, is_validate, agent_type=agent_type_this, **kwargs)
                             subagent_tool_call_results.append(subagent_result)
 
 
@@ -1031,7 +1095,9 @@ Provide a detailed answer and supporting information for this subtask. Your answ
                         resp = result_tmp.messages[-1].content
 
                         if self.config.multi_turn.delete_think_from_subagent_tools:
-                            resp = resp.split(think_block_close_tag)[-1].lstrip("\n")
+                            ## resp = resp.split(think_block_close_tag)[-1].lstrip("\n")
+                            ## Remove all <think>xxx</think> tags
+                            resp = re.sub(r'<think>.*?</think>', '', resp, flags=re.DOTALL)
 
                         # delete the tool block close tag
                         resp = re.sub(r'<use_mcp_tool>.*?</use_mcp_tool>', '', resp, flags=re.DOTALL)
@@ -1040,6 +1106,16 @@ Provide a detailed answer and supporting information for this subtask. Your answ
                         
 
                     # _req.add_tool_response_messages(self.tokenizer, [resp[:self.config.multi_turn.tool_response_cut_off_length] for resp, _, _ in tool_call_results], use_mcp_tool_call=use_mcp_tool_call)
+                    if agent_type == "main_agent":
+                        task_failed = current_turns >= self.config.multi_turn.max_turns or finish_reason_type == FinishReasonTypeEnum.LENGTH
+                        summary_this_stage = await self.final_summary_stage(_req, tool_call_contents, task_failed, do_sample, is_validate, self.config.multi_turn.use_mcp_tool_call, keep_think_text_for_last_round_only, think_block_close_tag, **kwargs)
+                        for sub_number in range(len(subagent_tool_call_results)):
+                            _req.summary_stages.append(summary_this_stage)
+                        #if len(subagent_tool_call_results) == 0 and len(tool_call_results) > 0:
+                        #    _req.summary_stages.append(summary_this_stage)
+                    else:
+                        _req.summary_stages.append('x')
+
                     _req.add_tool_response_messages(self.tokenizer, tool_call_contents, use_mcp_tool_call=use_mcp_tool_call)
 
                     for tool_call, (resp, reward, metrics) in zip(parsed_tool_calls, tool_call_results):
@@ -1314,6 +1390,7 @@ Provide a detailed answer and supporting information for this subtask. Your answ
         prompt_position_ids, response_position_ids = [], []
         prompt_loss_mask, response_loss_mask = [], []
         messages = []
+        summary_stages = []
         reward_scores = []
         batch_data_ids = [] #  to match orig prompt
         batch_data_uids = [] # to identify the orig data query <--> reqs_from_subagents relationship
@@ -1352,6 +1429,7 @@ Provide a detailed answer and supporting information for this subtask. Your answ
             prompt_loss_mask.append(torch.tensor(req.prompt_loss_mask, dtype=torch.int, device=tgt_device))
             response_loss_mask.append(torch.tensor(req.response_loss_mask, dtype=torch.int, device=tgt_device))
             messages.append({"messages": req.messages})
+            summary_stages.append({"summary_stages": req.summary_stages})
             reward_scores.append(req.reward_scores)
 
             # NOTE: for reward credit assignment to agent-call generated tokens
@@ -1437,6 +1515,7 @@ Provide a detailed answer and supporting information for this subtask. Your answ
             batch=batch,
             non_tensor_batch={
                 "messages": np.array(messages),
+                "summary_stages": np.array(summary_stages),
                 "reward_scores": np.array(reward_scores),
                 "batch_data_ids": np.array(batch_data_ids),
                 "uid": np.array(batch_data_uids),
@@ -1471,6 +1550,7 @@ Provide a detailed answer and supporting information for this subtask. Your answ
                     request_id=str(uuid4()),
                     state=AsyncRolloutRequestStateEnum.PENDING,
                     messages=raw_prompt.tolist(),
+                    summary_stages=[],
                     tool_schemas=_tool_schemas,
                     tools_kwargs=_tools_kwargs,
                     input_ids=_input_ids,
