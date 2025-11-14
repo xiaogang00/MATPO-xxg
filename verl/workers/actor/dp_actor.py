@@ -39,6 +39,9 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 
+from verl.trainer.ppo.core_algos import AdvantageEstimator
+
+
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 elif is_npu_available:
@@ -323,7 +326,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "token_level_scores"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -338,6 +341,9 @@ class DataParallelPPOActor(BasePPOActor):
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
+        no_tensor_select_keys = ["reqs_ids", "parent_reqs_ids"]
+        no_tensor_batch = data.select(non_tensor_batch_keys=no_tensor_select_keys).non_tensor_batch
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
@@ -346,6 +352,49 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
+
+        '''
+        data_original = copy.deepcopy(batch)
+        reqs_ids_original = no_tensor_batch["reqs_ids"]
+        main_agent_reward_split_index = []
+        main_agent_reward_split_index_reward_value = []
+        sub_agent_parenet_reward_split_index = []
+        length = len(data_original)
+        for i in range(length):
+            if not(data_original["is_from_subagent_tool"][i]):
+                response_length = data_original["responses"].size(-1)
+                loss_mask_this = data_original["loss_mask"][i, -response_length:]
+                end_location = [j-1 for j in range(1, len(loss_mask_this)) if (loss_mask_this[j-1] == 1 and loss_mask_this[j] == 0)]
+                if loss_mask_this[-1] == 1:
+                    end_location.append(len(loss_mask_this)-1)
+                main_agent_reward_split_index.append(end_location)
+                reward_value_this = []
+                for j in range(len(end_location)):
+                    reward_value_this.append(data_original["token_level_scores"][i, end_location[j]])
+                main_agent_reward_split_index_reward_value.append(reward_value_this)
+            else:
+                main_agent_reward_split_index.append(None)
+                main_agent_reward_split_index_reward_value.append(None)
+
+        import pdb; pdb.set_trace()
+        for i in range(length):
+            if not(data_original["is_from_subagent_tool"][i]):
+                sub_agent_parenet_reward_split_index.append(None)
+            else:
+                parent_idx = np.where(reqs_ids_original == no_tensor_batch["parent_reqs_ids"][i])[0][0]
+                response_length = data_original["responses"].size(-1)
+                loss_mask_this = data_original["loss_mask"][i, -response_length:]
+                end_location = [j-1 for j in range(1, len(loss_mask_this)) if (loss_mask_this[j-1] == 1 and loss_mask_this[j] == 0)]
+                if loss_mask_this[-1] == 1:
+                    end_location.append(len(loss_mask_this)-1)
+                reward_value_this = data_original["token_level_scores"][i, end_location[-1]]
+                parent_reward_value_this = main_agent_reward_split_index_reward_value[parent_idx]
+                index_this = parent_reward_value_this.index(reward_value_this)
+                sub_agent_parenet_reward_split_index.append(index_this)
+        print('aaaa')
+        import pdb; pdb.set_trace()
+        '''
+
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
@@ -386,7 +435,7 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
-                    old_log_prob = data["old_log_probs"]
+                    old_log_prob = data["old_log_probs"].clone()
                     advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
@@ -407,6 +456,51 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = response_mask.clone() # avoid in-place modification
                         is_pad = data["is_pad"].detach().cpu().numpy()
                         response_mask[is_pad, :] *= 0
+
+                    if self.config.log_compute_type == 'turn':
+                        length = len(data)
+                        for i in range(length):
+                            if not(data["is_from_subagent_tool"][i]):
+                                response_length = data["responses"][i].size(-1)
+                                loss_mask_this = data["loss_mask"][i, -response_length:]
+                                end_location = [j-1 for j in range(1, len(loss_mask_this)) if (loss_mask_this[j-1] == 1 and loss_mask_this[j] == 0)]
+                                if loss_mask_this[-1] == 1:
+                                    end_location.append(len(loss_mask_this)-1)
+                                if len(end_location) == 0:
+                                    continue
+
+                                end_location2 = [j+1 for j in range(0, len(loss_mask_this)-1) if (loss_mask_this[j] == 0 and loss_mask_this[j+1] == 1)]
+                                if not(len(end_location2) == len(end_location)):
+                                    end_location2 = [0] + end_location2
+                                ## print(end_location, end_location2, loss_mask_this)
+                                assert len(end_location) == len(end_location2)
+                                for j in range(len(end_location)):
+                                    start_point = end_location2[j]
+                                    end_point = end_location[j]
+                                    log_sum_old = 0
+                                    log_sum_new = 0
+                                    for k in range(start_point, end_point+1, 1):
+                                        log_sum_old += old_log_prob[i, k]
+                                        log_sum_new += log_prob[i, k]
+                                    old_log_prob[i, start_point:end_point+1] = log_sum_old
+                                    log_prob[i, start_point:end_point+1] = log_sum_new
+                            else:
+                                response_length = data["responses"][i].size(-1)
+                                loss_mask_this = data["loss_mask"][i, -response_length:]
+                                end_location = [j-1 for j in range(1, len(loss_mask_this)) if (loss_mask_this[j-1] == 1 and loss_mask_this[j] == 0)]
+                                if loss_mask_this[-1] == 1:
+                                    end_location.append(len(loss_mask_this)-1)
+                                end_location_this = end_location[-1]
+                                log_sum_old = 0
+                                log_sum_new = 0
+                                for j in range(end_location_this+1):
+                                    if loss_mask_this[j] == 1:
+                                        log_sum_old += old_log_prob[i, j]
+                                        log_sum_new += log_prob[i, j]
+                                for j in range(end_location_this+1):
+                                    if loss_mask_this[j] == 1:
+                                        old_log_prob[i, j] = log_sum_old
+                                        log_prob[i, j] = log_sum_new
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
