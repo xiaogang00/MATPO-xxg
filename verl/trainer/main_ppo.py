@@ -19,7 +19,7 @@ import hydra
 import ray
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.reward import load_reward_manager, load_reward_manager_val
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -110,7 +110,6 @@ class TaskRunner:
             if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
-
         # Define worker classes based on the actor strategy.
         if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"]
@@ -173,7 +172,7 @@ class TaskRunner:
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
-        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
+        val_reward_fn = load_reward_manager_val(config, tokenizer, num_examine=1, **config.reward_model_val.get("reward_kwargs", {}))
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         from verl.utils.dataset.rl_dataset import collate_fn
