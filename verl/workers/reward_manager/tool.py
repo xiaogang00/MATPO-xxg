@@ -61,6 +61,7 @@ async def batch_compute_scores_async(client, data_source_list, response_str_list
 
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
+                ##model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 max_completion_tokens=2
             )
