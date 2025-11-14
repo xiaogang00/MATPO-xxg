@@ -39,6 +39,7 @@ from tqdm import tqdm
 from verl.protocol import (
     DataProto,
     broadcast_advantage_return_tensor_by_reqs_ids,
+    broadcast_advantage_return_tensor_by_reqs_ids_only_padded,
     broadcast_dataproto_by_uid,
     broadcast_reward_tensor_by_reqs_ids,
     extract_main_agent_rollouts,
@@ -219,7 +220,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None, data_subagent=None):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -277,6 +278,33 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GRPO_TURN:
+        # Initialize the mask for GRPO calculation
+        grpo_calculation_mask = data.batch["response_mask"]
+        grpo_subagent_calculation_mask = data_subagent.batch["response_mask"]
+        if multi_turn:
+            # If multi-turn, replace the mask with the relevant part of loss_mask
+            # Get length from the initial response mask
+            response_length = grpo_calculation_mask.size(1)
+            # This mask is the one intended for GRPO
+            grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+            response_length_subagent = grpo_subagent_calculation_mask.size(1)
+            grpo_subagent_calculation_mask = data_subagent.batch["loss_mask"][:, -response_length_subagent:]
+        # Call compute_grpo_outcome_advantage with parameters matching its definition
+        advantages, returns, advantages_subagent, returns_subagent = core_algos.compute_grpo_outcome_advantage_turn(
+            token_level_rewards=data.batch["token_level_rewards"],
+            token_level_rewards_subagent=data_subagent.batch["token_level_rewards"],
+            reqs_ids_list=data.non_tensor_batch["reqs_ids"],
+            parent_reqs_ids_list=data_subagent.non_tensor_batch["parent_reqs_ids"],
+            response_mask=grpo_calculation_mask,
+            response_mask_subagent=grpo_subagent_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data_subagent.batch["advantages"] = advantages_subagent
+        data_subagent.batch["returns"] = returns_subagent
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -294,7 +322,12 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-    return data
+    
+    if data_subagent is not None:
+        return data, data_subagent
+    else:
+        return data
+    ## return data
 
 
 class RayPPOTrainer:
@@ -354,6 +387,7 @@ class RayPPOTrainer:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
+            AdvantageEstimator.GRPO_TURN,
             AdvantageEstimator.GRPO_PASSK,
             AdvantageEstimator.REINFORCE_PLUS_PLUS,
             AdvantageEstimator.REMAX,
@@ -484,7 +518,7 @@ class RayPPOTrainer:
         # check multi_turn with tool config
         if config.actor_rollout_ref.rollout.multi_turn.enable:
             assert config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None, "tool_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
-            assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
+            assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO, AdvantageEstimator.GRPO_TURN], "only GRPO is tested for multi-turn with tool"
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -719,7 +753,8 @@ class RayPPOTrainer:
             # NOTE: the multi-agent training setting is handled in reward_manager.subagent_tool.py. Do not need to split the batch into main-agent and subagent-tool rollouts here.
             if enable_subagent_tool_rollout:
                 from verl.workers.reward_manager.subagent_tool import SubagentToolRewardManager
-                assert isinstance(self.val_reward_fn, SubagentToolRewardManager), "The val_reward_fn must be a subagent_tool reward manager when subagent-tool rollouts are included in the loss computation."
+                from verl.workers.reward_manager.subagent_tool_new import NewSubagentToolRewardManager
+                assert isinstance(self.val_reward_fn, SubagentToolRewardManager) or isinstance(self.val_reward_fn, NewSubagentToolRewardManager), "The val_reward_fn must be a subagent_tool reward manager when subagent-tool rollouts are included in the loss computation."
 
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
@@ -1053,7 +1088,6 @@ class RayPPOTrainer:
                             self.async_rollout_manager.sleep()
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1065,11 +1099,9 @@ class RayPPOTrainer:
                             batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
                             batch.batch["reward_baselines"] = reward_baseline_tensor
-
                             del gen_baseline_batch, gen_baseline_output
-
-                      
                     # toggle to control whether use subagent-tool rollouts in GRPO training
+                    
                     reqs_from_subagents_serialized = gen_batch_output.non_tensor_batch["reqs_from_subagents_serialized"]
                     
                     if self.config.actor_rollout_ref.rollout.get("include_subagent_tool_rollout_in_loss", False):
@@ -1119,12 +1151,14 @@ class RayPPOTrainer:
                         else:
                             if include_subagent_tool_rollout_in_loss:
                                 from verl.workers.reward_manager import SubagentToolRewardManager
-                                assert isinstance(self.reward_fn, SubagentToolRewardManager), "The reward_fn must be a subagent_tool reward manager when subagent-tool rollouts are included in the loss computation."
+                                from verl.workers.reward_manager import NewSubagentToolRewardManager
+                                assert isinstance(self.reward_fn, SubagentToolRewardManager) or isinstance(self.reward_fn, NewSubagentToolRewardManager), "The reward_fn must be a subagent_tool reward manager when subagent-tool rollouts are included in the loss computation."
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                             # assign the reward_tensor and reward_extra_infos_dict to the main-agent rollouts
                             batch.batch["token_level_scores"] = reward_tensor
+                            ## the reward tensor follows the turn-level order
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
+                    
                     # when subagent-tool rollouts are included in the loss computation, zero-pad the batch to the divisor of world_size, avoid DP distribution protocol bug in fsdp_workers.py
                     # NOTE: this func involve the 'is_pad' boolean-tensor flag, which is used in update_actor() to mask out the padded samples in loss computation in dp_actor.py.
                     if include_subagent_tool_rollout_in_loss:
@@ -1137,11 +1171,10 @@ class RayPPOTrainer:
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
-
                     
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch) ##old_log_prob.batch['old_log_probs'].shape
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1184,7 +1217,6 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
                     # compute values
                     if self.use_critic:
                         with _timer("values", timing_raw):
@@ -1220,25 +1252,49 @@ class RayPPOTrainer:
                             # in multi-agent setting, pop out the main-agent-rollouts to avoid computing advantage for subagent-tool-rollouts and padded rollouts
                             batch, batch_from_subagent_tool, batch_padded = extract_main_agent_rollouts(batch)
                         
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            config=self.config.algorithm,
-                        )
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_TURN:
+                            batch, batch_from_subagent_tool = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                config=self.config.algorithm,
+                                data_subagent=batch_from_subagent_tool,
+                            )
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                config=self.config.algorithm,
+                            )
 
                         if include_subagent_tool_rollout_in_loss:
                             # in multi-agent setting, broadcast the advantage and return tensor to subagent-tool rollouts according to main parent reqs <--> reqs_from_subagents relationship, and append the subagent-tool rollouts and padded rollouts back to the main-agent rollouts
                             # NOTE: set zero advantages and returns for padded rollouts
-                            batch_from_subagent_tool, batch_padded = broadcast_advantage_return_tensor_by_reqs_ids(
-                                data_main_agent=batch,
-                                data_from_subagent_tool=batch_from_subagent_tool,
-                                data_padded=batch_padded,
-                            )
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_TURN:
+                                batch_padded = broadcast_advantage_return_tensor_by_reqs_ids_only_padded(
+                                    data_main_agent=batch,
+                                    data_padded=batch_padded,
+                                )
+                            else:
+                                batch_from_subagent_tool, batch_padded = broadcast_advantage_return_tensor_by_reqs_ids(
+                                    data_main_agent=batch,
+                                    data_from_subagent_tool=batch_from_subagent_tool,
+                                    data_padded=batch_padded,
+                                )
+                                '''
+                                batch = DataProto.concat([batch, batch_from_subagent_tool])
+                                if batch_padded is not None:
+                                    batch = DataProto.concat([batch, batch_padded])
+                                '''
                             batch = DataProto.concat([batch, batch_from_subagent_tool])
                             if batch_padded is not None:
                                 batch = DataProto.concat([batch, batch_padded])
