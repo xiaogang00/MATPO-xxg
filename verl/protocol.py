@@ -939,6 +939,7 @@ def list_of_reqs_to_dataproto(reqs_list: list, tgt_device: torch.device, config:
     prompt_loss_mask, response_loss_mask = [], []
     messages = []
     reward_scores = []
+    summary_stages = []
     batch_data_ids = [] #  to match orig prompt
     batch_data_uids = [] # to identify the orig data <--> reqs_from_subagents relationship
     reqs_ids = [] # to identify req
@@ -979,6 +980,7 @@ def list_of_reqs_to_dataproto(reqs_list: list, tgt_device: torch.device, config:
         prompt_loss_mask.append(torch.tensor(req.prompt_loss_mask, dtype=torch.int, device=tgt_device))
         response_loss_mask.append(torch.tensor(req.response_loss_mask, dtype=torch.int, device=tgt_device))
         messages.append({"messages": req.messages})
+        summary_stages.append({"summary_stages": req.summary_stages})
         reward_scores.append(req.reward_scores)
 
         # NOTE: for reward credit assignment to agent-call generated tokens
@@ -1056,6 +1058,7 @@ def list_of_reqs_to_dataproto(reqs_list: list, tgt_device: torch.device, config:
         batch=batch,
         non_tensor_batch={
             "messages": np.array(messages),
+            "summary_stages": np.array(summary_stages),
             "reward_scores": np.array(reward_scores),
             "batch_data_ids": np.array(batch_data_ids),
             "uid": np.array(batch_data_uids),
@@ -1294,6 +1297,32 @@ def broadcast_advantage_return_tensor_by_reqs_ids(
         data_padded.batch["returns"] = torch.zeros_like(data_padded.batch["token_level_scores"], device=device)
 
     return data_from_subagent_tool, data_padded
+
+
+
+def broadcast_advantage_return_tensor_by_reqs_ids_only_padded(
+    data_main_agent: DataProto, 
+    data_padded: DataProto,
+) -> Tuple[DataProto, Any]:
+    """
+    Broadcast the advantage and return tensor to agent-tool rollouts according to main parent reqs <--> reqs_from_subagents relationship.
+
+    Args:
+        data_main_agent (DataProto): The main-agent rollouts.
+        data_from_subagent_tool (DataProto): The agent-tool rollouts to broadcast the advantage and return tensor to.
+        data_padded (DataProto): The padded rollouts to add zero advantages and returns to.
+
+    Returns:
+        DataProto: The agent-tool rollouts with the advantage and return tensor broadcasted.
+    """
+    # establish correspondence between main_agent_rollouts and subagent_tool_rollouts
+    if data_padded is not None:
+        # set zero advantages and returns for padded rollouts
+        device = data_main_agent.batch["token_level_scores"].device
+        data_padded.batch["advantages"] = torch.zeros_like(data_padded.batch["token_level_scores"], device=device)
+        data_padded.batch["returns"] = torch.zeros_like(data_padded.batch["token_level_scores"], device=device)
+
+    return data_padded
 
 
 def reorder_rollouts_by_main_agent_rollouts(data: DataProto) -> DataProto:
