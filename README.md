@@ -481,7 +481,16 @@ You can customize your own rollout orchestration by modifying the logic and sche
 If you find MATPO-PR helpful in your research, please consider citing our paper:
 
 ```bibtex
-@misc{mo2025multiagenttoolintegratedpolicyoptimization,
+@misc{xiaogang2026matpo,
+  author       = {Zhanfeng Mo and Xiaogang Xu and Xingxuan Li and Lidong Bing},
+  title        = {Multi-Agent Tool-Integrated Policy Optimization with Process Reward},
+  year         = {2026},
+  howpublished = {GitHub Repository},
+  url          = {https://github.com/xiaogang00/MATPO-PR/blob/main/MATPO-PR-Report.pdf},
+  note         = {Accessed: \today. Available at \url{https://github.com/xiaogang00/MATPO-PR}}
+}
+
+@misc{mo2025multi-agent-tool-integrated-policy-optimization,
       title={Multi-Agent Tool-Integrated Policy Optimization}, 
       author={Zhanfeng Mo and Xingxuan Li and Yuntao Chen and Lidong Bing},
       year={2025},
